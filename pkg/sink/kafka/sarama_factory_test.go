@@ -15,12 +15,11 @@ package kafka
 
 import (
 	"context"
+	stdErrors "errors"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/IBM/sarama"
-	"github.com/IBM/sarama/mocks"
 	"github.com/pingcap/tiflow/cdc/model"
 	"github.com/stretchr/testify/require"
 )
@@ -47,11 +46,7 @@ func TestSyncProducer(t *testing.T) {
 	t.Parallel()
 
 	leader := sarama.NewMockBroker(t, 1)
-
-	metadataResponse := new(sarama.MetadataResponse)
-	metadataResponse.AddBroker(leader.Addr(), leader.BrokerID())
-	// Response for `sarama.NewClient`
-	leader.Returns(metadataResponse)
+	setProducerMockHandlers(t, leader)
 
 	defer leader.Close()
 
@@ -79,11 +74,7 @@ func TestAsyncProducer(t *testing.T) {
 	t.Parallel()
 
 	leader := sarama.NewMockBroker(t, 1)
-
-	metadataResponse := new(sarama.MetadataResponse)
-	metadataResponse.AddBroker(leader.Addr(), leader.BrokerID())
-	// Response for `sarama.NewClient`
-	leader.Returns(metadataResponse)
+	setProducerMockHandlers(t, leader)
 
 	defer leader.Close()
 
@@ -105,144 +96,182 @@ func TestAsyncProducer(t *testing.T) {
 	async.Close()
 }
 
-// mockClientForHeartbeat is a mock sarama.Client used to verify
-// that the Brokers() method is called as part of the heartbeat logic.
-type mockClientForHeartbeat struct {
-	sarama.Client // Embed the interface to avoid implementing all methods.
-	brokersCalled chan struct{}
+func setProducerMockHandlers(t *testing.T, broker *sarama.MockBroker) {
+	broker.SetHandlerByMap(map[string]sarama.MockResponse{
+		"ApiVersionsRequest": sarama.NewMockApiVersionsResponse(t).SetApiKeys([]sarama.ApiVersionsResponseKey{
+			{ApiKey: 0, MinVersion: 0, MaxVersion: 8},  // Produce
+			{ApiKey: 1, MinVersion: 0, MaxVersion: 11}, // Fetch
+			{ApiKey: 2, MinVersion: 0, MaxVersion: 5},  // ListOffsets
+			{ApiKey: 3, MinVersion: 0, MaxVersion: 10}, // Metadata
+			{ApiKey: 18, MinVersion: 0, MaxVersion: 3}, // ApiVersions
+		}),
+		"MetadataRequest": sarama.NewMockMetadataResponse(t).
+			SetBroker(broker.Addr(), broker.BrokerID()),
+	})
 }
 
-// Brokers is the mocked method. It sends a signal to a channel when called.
-func (c *mockClientForHeartbeat) Brokers() []*sarama.Broker {
-	// The function under test iterates over the returned slice.
-	// Returning nil is fine, as we only want to check if this method was called.
-	c.brokersCalled <- struct{}{}
-	return nil
+type testSaramaClient struct {
+	sarama.Client
+	closeCalls int
+	closed     bool
+	closeErr   error
+	callOrder  *[]string
+	callLabel  string
+
+	// doneCh is closed after Close finishes, providing a happens-before
+	// relationship so tests can safely wait for async closes without races.
+	doneOnce  sync.Once
+	doneCh    chan struct{}
+	closeOnce sync.Once
 }
 
-// Close closes the signal channel.
-func (c *mockClientForHeartbeat) Close() error {
-	close(c.brokersCalled)
-	return nil
+func (c *testSaramaClient) done() chan struct{} {
+	c.doneOnce.Do(func() {
+		c.doneCh = make(chan struct{})
+	})
+	return c.doneCh
 }
 
-func TestSaramaSyncProducerHeartbeatThrottling(t *testing.T) {
-	t.Parallel()
-
-	mockClient := &mockClientForHeartbeat{
-		// Use a buffered channel to prevent blocking in case of unexpected calls.
-		brokersCalled: make(chan struct{}, 10),
-	}
-
-	producer := &saramaSyncProducer{
-		id:                    model.DefaultChangeFeedID("test-sync-producer"),
-		producer:              nil, // Not needed for this test.
-		client:                mockClient,
-		keepConnAliveInterval: 100 * time.Millisecond,
-		// Set the last heartbeat time to a long time ago to ensure the first call is not throttled.
-		lastHeartbeatTime: time.Now().Add(-200 * time.Millisecond),
-	}
-
-	// First call, should trigger a call to Brokers().
-	producer.HeartbeatBrokers()
+func (c *testSaramaClient) closeDone() bool {
 	select {
-	case <-mockClient.brokersCalled:
-		// Expected behavior.
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("HeartbeatBrokers should have called client.Brokers(), but it did not")
-	}
-
-	// Second call immediately after, should be throttled.
-	producer.HeartbeatBrokers()
-	select {
-	case <-mockClient.brokersCalled:
-		t.Fatal("client.Brokers() was called, but it should have been throttled")
-	case <-time.After(50 * time.Millisecond):
-		// Expected behavior, no call was made.
-	}
-
-	// Wait for the interval to pass.
-	time.Sleep(producer.keepConnAliveInterval)
-
-	// Third call, should trigger a call to Brokers() again.
-	producer.HeartbeatBrokers()
-	select {
-	case <-mockClient.brokersCalled:
-		// Expected behavior.
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("HeartbeatBrokers should have called client.Brokers() again, but it did not")
+	case <-c.done():
+		return true
+	default:
+		return false
 	}
 }
 
-func TestSaramaAsyncProducerHeartbeat(t *testing.T) {
-	t.Parallel()
-
-	mockClient := &mockClientForHeartbeat{
-		brokersCalled: make(chan struct{}, 10),
+func (c *testSaramaClient) Close() error {
+	c.closeCalls++
+	c.closed = true
+	if c.callOrder != nil {
+		*c.callOrder = append(*c.callOrder, c.callLabel)
 	}
-	// Using a test config is better practice for initializing mocks.
-	config := mocks.NewTestConfig()
-	config.Producer.Return.Successes = true
-	config.Producer.Return.Errors = true
-	mockAsyncProducer := mocks.NewAsyncProducer(t, config)
+	c.closeOnce.Do(func() {
+		close(c.done())
+	})
+	return c.closeErr
+}
 
-	producer := &saramaAsyncProducer{
-		client:                mockClient,
-		producer:              mockAsyncProducer, // Use the mock producer.
-		changefeedID:          model.DefaultChangeFeedID("test-async-producer"),
-		keepConnAliveInterval: 50 * time.Millisecond, // Use a short interval for testing.
-		failpointCh:           make(chan error, 1),
+func (c *testSaramaClient) Closed() bool {
+	return c.closed
+}
+
+type testSaramaClusterAdmin struct {
+	sarama.ClusterAdmin
+	closeCalls int
+	closeErr   error
+	callOrder  *[]string
+	callLabel  string
+}
+
+func (a *testSaramaClusterAdmin) Close() error {
+	a.closeCalls++
+	if a.callOrder != nil {
+		*a.callOrder = append(*a.callOrder, a.callLabel)
 	}
+	return a.closeErr
+}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		_ = producer.AsyncRunCallback(ctx)
+// TestSaramaFactoryAdminClientClosesClientOnAdminInitFailure verifies the
+// factory closes the raw sarama client when admin construction fails before any
+// wrapper takes ownership.
+func TestSaramaFactoryAdminClientClosesClientOnAdminInitFailure(t *testing.T) {
+	o := NewOptions()
+	o.Version = "2.0.0"
+	o.IsAssignedVersion = true
+	o.BrokerEndpoints = []string{"127.0.0.1:9092"}
+	o.ClientID = "sarama-test"
+
+	factory, err := NewSaramaFactory(o, model.DefaultChangeFeedID("sarama-test"))
+	require.NoError(t, err)
+	saramaFactory, ok := factory.(*saramaFactory)
+	require.True(t, ok)
+
+	client := &testSaramaClient{}
+	oldClientCreator := newSaramaClientImpl
+	oldAdminCreator := newSaramaClusterAdminFromClientImpl
+	newSaramaClientImpl = func([]string, *sarama.Config) (sarama.Client, error) {
+		return client, nil
+	}
+	newSaramaClusterAdminFromClientImpl = func(sarama.Client) (sarama.ClusterAdmin, error) {
+		return nil, stdErrors.New("injected admin init failure")
+	}
+	defer func() {
+		newSaramaClientImpl = oldClientCreator
+		newSaramaClusterAdminFromClientImpl = oldAdminCreator
 	}()
 
-	// Check for the first heartbeat.
-	select {
-	case <-mockClient.brokersCalled:
-		// Good, first heartbeat received.
-	case <-time.After(producer.keepConnAliveInterval * 4): // Use a more generous timeout
-		t.Fatal("Timed out waiting for the first heartbeat")
+	_, err = saramaFactory.AdminClient(context.Background())
+	require.Error(t, err)
+	require.Equal(t, 1, client.closeCalls)
+	require.True(t, client.closed)
+}
+
+// TestSaramaFactorySyncProducerClosesClientOnInitFailure verifies the factory
+// releases the shared sarama client when sync producer construction fails.
+func TestSaramaFactorySyncProducerClosesClientOnInitFailure(t *testing.T) {
+	o := NewOptions()
+	o.Version = "2.0.0"
+	o.IsAssignedVersion = true
+	o.BrokerEndpoints = []string{"127.0.0.1:9092"}
+	o.ClientID = "sarama-test"
+
+	factory, err := NewSaramaFactory(o, model.DefaultChangeFeedID("sarama-test"))
+	require.NoError(t, err)
+	saramaFactory, ok := factory.(*saramaFactory)
+	require.True(t, ok)
+
+	client := &testSaramaClient{}
+	oldClientCreator := newSaramaClientImpl
+	oldSyncCreator := newSaramaSyncProducerFromClientImpl
+	newSaramaClientImpl = func([]string, *sarama.Config) (sarama.Client, error) {
+		return client, nil
 	}
-
-	// Check for the second heartbeat.
-	select {
-	case <-mockClient.brokersCalled:
-		// Good, second heartbeat received.
-	case <-time.After(producer.keepConnAliveInterval * 4): // Use a more generous timeout
-		t.Fatal("Timed out waiting for the second heartbeat")
+	newSaramaSyncProducerFromClientImpl = func(sarama.Client) (sarama.SyncProducer, error) {
+		return nil, stdErrors.New("injected sync producer init failure")
 	}
-
-	// Stop the AsyncRunCallback goroutine.
-	cancel()
-	wg.Wait()
-
-	// Manually close the mock producer's input channel to fix a deadlock issue.
-	// This deterministically signals the mock's internal goroutine to shut down.
-	// This is safe because AsyncRunCallback has already exited and will no longer
-	// try to close or write to the producer.
-	close(mockAsyncProducer.Input())
-
-	// Drain the producer's channels to ensure its internal goroutine has shut down
-	// before the test finishes. This prevents both leaks and deadlocks.
-	var drainWg sync.WaitGroup
-	drainWg.Add(2)
-	go func() {
-		defer drainWg.Done()
-		for range mockAsyncProducer.Successes() {
-			// Drain successes
-		}
+	defer func() {
+		newSaramaClientImpl = oldClientCreator
+		newSaramaSyncProducerFromClientImpl = oldSyncCreator
 	}()
-	go func() {
-		defer drainWg.Done()
-		for range mockAsyncProducer.Errors() {
-			// Drain errors
-		}
+
+	_, err = saramaFactory.SyncProducer(context.Background())
+	require.Error(t, err)
+	require.Equal(t, 1, client.closeCalls)
+	require.True(t, client.closed)
+}
+
+// TestSaramaFactoryAsyncProducerClosesClientOnInitFailure verifies the factory
+// releases the shared sarama client when async producer construction fails.
+func TestSaramaFactoryAsyncProducerClosesClientOnInitFailure(t *testing.T) {
+	o := NewOptions()
+	o.Version = "2.0.0"
+	o.IsAssignedVersion = true
+	o.BrokerEndpoints = []string{"127.0.0.1:9092"}
+	o.ClientID = "sarama-test"
+
+	factory, err := NewSaramaFactory(o, model.DefaultChangeFeedID("sarama-test"))
+	require.NoError(t, err)
+	saramaFactory, ok := factory.(*saramaFactory)
+	require.True(t, ok)
+
+	client := &testSaramaClient{}
+	oldClientCreator := newSaramaClientImpl
+	oldAsyncCreator := newSaramaAsyncProducerFromClientImpl
+	newSaramaClientImpl = func([]string, *sarama.Config) (sarama.Client, error) {
+		return client, nil
+	}
+	newSaramaAsyncProducerFromClientImpl = func(sarama.Client) (sarama.AsyncProducer, error) {
+		return nil, stdErrors.New("injected async producer init failure")
+	}
+	defer func() {
+		newSaramaClientImpl = oldClientCreator
+		newSaramaAsyncProducerFromClientImpl = oldAsyncCreator
 	}()
-	drainWg.Wait()
+
+	_, err = saramaFactory.AsyncProducer(context.Background(), make(chan error, 1))
+	require.Error(t, err)
+	require.Equal(t, 1, client.closeCalls)
+	require.True(t, client.closed)
 }

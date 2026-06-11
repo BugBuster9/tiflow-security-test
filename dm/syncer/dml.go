@@ -26,7 +26,6 @@ import (
 	tcontext "github.com/pingcap/tiflow/dm/pkg/context"
 	"github.com/pingcap/tiflow/dm/pkg/log"
 	"github.com/pingcap/tiflow/dm/pkg/terror"
-	"github.com/pingcap/tiflow/dm/pkg/utils"
 	"github.com/pingcap/tiflow/pkg/sqlmodel"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
@@ -131,7 +130,6 @@ func adjustValueFromBinlogData(
 // nolint:dupl
 func (s *Syncer) genAndFilterInsertDMLs(tctx *tcontext.Context, param *genDMLParam, filterExprs []expression.Expression) ([]*sqlmodel.RowChange, error) {
 	var (
-		tableID         = utils.GenTableID(param.targetTable)
 		originalDataSeq = param.originalData
 		ti              = param.sourceTableInfo
 		extendData      = param.extendData
@@ -139,7 +137,7 @@ func (s *Syncer) genAndFilterInsertDMLs(tctx *tcontext.Context, param *genDMLPar
 	)
 
 	// if downstream pk/uk(not null) exits, then use downstream pk/uk(not null)
-	downstreamTableInfo, err := s.schemaTracker.GetDownStreamTableInfo(tctx, tableID, ti)
+	downstreamTableInfo, err := s.prepareDownStreamTableInfo(tctx, param.sourceTable, param.targetTable, ti)
 	if err != nil {
 		return nil, err
 	}
@@ -176,6 +174,7 @@ RowLoop:
 			s.sessCtx,
 		)
 		rowChange.SetWhereHandle(downstreamTableInfo.WhereHandle)
+		rowChange.SetForeignKeyRelations(downstreamTableInfo.ForeignKeyRelations)
 		dmls = append(dmls, rowChange)
 	}
 
@@ -190,7 +189,6 @@ func (s *Syncer) genAndFilterUpdateDMLs(
 	newValueFilters []expression.Expression,
 ) ([]*sqlmodel.RowChange, error) {
 	var (
-		tableID      = utils.GenTableID(param.targetTable)
 		originalData = param.originalData
 		ti           = param.sourceTableInfo
 		extendData   = param.extendData
@@ -198,7 +196,7 @@ func (s *Syncer) genAndFilterUpdateDMLs(
 	)
 
 	// if downstream pk/uk(not null) exits, then use downstream pk/uk(not null)
-	downstreamTableInfo, err := s.schemaTracker.GetDownStreamTableInfo(tctx, tableID, ti)
+	downstreamTableInfo, err := s.prepareDownStreamTableInfo(tctx, param.sourceTable, param.targetTable, ti)
 	if err != nil {
 		return nil, err
 	}
@@ -253,6 +251,7 @@ RowLoop:
 			s.sessCtx,
 		)
 		rowChange.SetWhereHandle(downstreamTableInfo.WhereHandle)
+		rowChange.SetForeignKeyRelations(downstreamTableInfo.ForeignKeyRelations)
 		dmls = append(dmls, rowChange)
 	}
 
@@ -262,7 +261,6 @@ RowLoop:
 // nolint:dupl
 func (s *Syncer) genAndFilterDeleteDMLs(tctx *tcontext.Context, param *genDMLParam, filterExprs []expression.Expression) ([]*sqlmodel.RowChange, error) {
 	var (
-		tableID    = utils.GenTableID(param.targetTable)
 		dataSeq    = param.originalData
 		ti         = param.sourceTableInfo
 		extendData = param.extendData
@@ -270,7 +268,7 @@ func (s *Syncer) genAndFilterDeleteDMLs(tctx *tcontext.Context, param *genDMLPar
 	)
 
 	// if downstream pk/uk(not null) exits, then use downstream pk/uk(not null)
-	downstreamTableInfo, err := s.schemaTracker.GetDownStreamTableInfo(tctx, tableID, ti)
+	downstreamTableInfo, err := s.prepareDownStreamTableInfo(tctx, param.sourceTable, param.targetTable, ti)
 	if err != nil {
 		return nil, err
 	}
@@ -307,6 +305,7 @@ RowLoop:
 			s.sessCtx,
 		)
 		rowChange.SetWhereHandle(downstreamTableInfo.WhereHandle)
+		rowChange.SetForeignKeyRelations(downstreamTableInfo.ForeignKeyRelations)
 		dmls = append(dmls, rowChange)
 	}
 
@@ -419,10 +418,12 @@ func genDMLsWithSameTable(op sqlmodel.DMLType, jobs []*job) ([]string, [][]inter
 	if op == sqlmodel.DMLUpdate {
 		for i, j := range jobs {
 			if j.safeMode {
-				query, arg := j.dml.GenSQL(sqlmodel.DMLDelete)
-				queries = append(queries, query)
-				args = append(args, arg)
-				query, arg = j.dml.GenSQL(sqlmodel.DMLReplace)
+				if j.dml.IsPrimaryOrUniqueKeyUpdated() {
+					query, arg := j.dml.GenSQL(sqlmodel.DMLDelete)
+					queries = append(queries, query)
+					args = append(args, arg)
+				}
+				query, arg := j.dml.GenSQL(sqlmodel.DMLReplace)
 				queries = append(queries, query)
 				args = append(args, arg)
 				continue
