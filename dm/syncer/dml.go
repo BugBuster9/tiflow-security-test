@@ -15,6 +15,7 @@ package syncer
 
 import (
 	"encoding/binary"
+	"strings"
 
 	"github.com/pingcap/tidb/pkg/expression"
 	"github.com/pingcap/tidb/pkg/meta/model"
@@ -141,11 +142,13 @@ func (s *Syncer) genAndFilterInsertDMLs(tctx *tcontext.Context, param *genDMLPar
 	if err != nil {
 		return nil, err
 	}
+	whereHandle := downstreamTableInfo.WhereHandle(param.sourceTable, param.sourceTableInfo)
 
 	if extendData != nil {
 		originalDataSeq = extendData
 	}
 
+	causalityKeySourceTable := s.causalityKeySourceTableNameForRowChange(param.sourceTable)
 RowLoop:
 	for _, data := range originalDataSeq {
 		originalValue, err := adjustValueFromBinlogData(data, ti)
@@ -153,8 +156,12 @@ RowLoop:
 			return nil, err
 		}
 
+		filterRow, err := rowForExpressionFilter(s.sessCtx, originalValue, ti.Columns, filterExprs)
+		if err != nil {
+			return nil, err
+		}
 		for _, expr := range filterExprs {
-			skip, err := SkipDMLByExpression(s.sessCtx, originalValue, expr, ti.Columns)
+			skip, err := SkipDMLByExpression(s.sessCtx, filterRow, expr)
 			if err != nil {
 				return nil, err
 			}
@@ -173,7 +180,8 @@ RowLoop:
 			downstreamTableInfo.TableInfo,
 			s.sessCtx,
 		)
-		rowChange.SetWhereHandle(downstreamTableInfo.WhereHandle)
+		rowChange.SetWhereHandle(whereHandle)
+		rowChange.SetCausalityKeySourceTable(causalityKeySourceTable)
 		rowChange.SetForeignKeyRelations(downstreamTableInfo.ForeignKeyRelations)
 		dmls = append(dmls, rowChange)
 	}
@@ -200,11 +208,13 @@ func (s *Syncer) genAndFilterUpdateDMLs(
 	if err != nil {
 		return nil, err
 	}
+	whereHandle := downstreamTableInfo.WhereHandle(param.sourceTable, param.sourceTableInfo)
 
 	if extendData != nil {
 		originalData = extendData
 	}
 
+	causalityKeySourceTable := s.causalityKeySourceTableNameForRowChange(param.sourceTable)
 RowLoop:
 	for i := 0; i < len(originalData); i += 2 {
 		oriOldData := originalData[i]
@@ -223,14 +233,22 @@ RowLoop:
 			return nil, err
 		}
 
+		oldFilterRow, err := rowForExpressionFilter(s.sessCtx, oriOldValues, ti.Columns, oldValueFilters)
+		if err != nil {
+			return nil, err
+		}
+		newFilterRow, err := rowForExpressionFilter(s.sessCtx, oriChangedValues, ti.Columns, newValueFilters)
+		if err != nil {
+			return nil, err
+		}
 		for j := range oldValueFilters {
 			// AND logic
 			oldExpr, newExpr := oldValueFilters[j], newValueFilters[j]
-			skip1, err := SkipDMLByExpression(s.sessCtx, oriOldValues, oldExpr, ti.Columns)
+			skip1, err := SkipDMLByExpression(s.sessCtx, oldFilterRow, oldExpr)
 			if err != nil {
 				return nil, err
 			}
-			skip2, err := SkipDMLByExpression(s.sessCtx, oriChangedValues, newExpr, ti.Columns)
+			skip2, err := SkipDMLByExpression(s.sessCtx, newFilterRow, newExpr)
 			if err != nil {
 				return nil, err
 			}
@@ -250,7 +268,8 @@ RowLoop:
 			downstreamTableInfo.TableInfo,
 			s.sessCtx,
 		)
-		rowChange.SetWhereHandle(downstreamTableInfo.WhereHandle)
+		rowChange.SetWhereHandle(whereHandle)
+		rowChange.SetCausalityKeySourceTable(causalityKeySourceTable)
 		rowChange.SetForeignKeyRelations(downstreamTableInfo.ForeignKeyRelations)
 		dmls = append(dmls, rowChange)
 	}
@@ -272,11 +291,13 @@ func (s *Syncer) genAndFilterDeleteDMLs(tctx *tcontext.Context, param *genDMLPar
 	if err != nil {
 		return nil, err
 	}
+	whereHandle := downstreamTableInfo.WhereHandle(param.sourceTable, param.sourceTableInfo)
 
 	if extendData != nil {
 		dataSeq = extendData
 	}
 
+	causalityKeySourceTable := s.causalityKeySourceTableNameForRowChange(param.sourceTable)
 RowLoop:
 	for _, data := range dataSeq {
 		value, err := adjustValueFromBinlogData(data, ti)
@@ -284,8 +305,12 @@ RowLoop:
 			return nil, err
 		}
 
+		filterRow, err := rowForExpressionFilter(s.sessCtx, value, ti.Columns, filterExprs)
+		if err != nil {
+			return nil, err
+		}
 		for _, expr := range filterExprs {
-			skip, err := SkipDMLByExpression(s.sessCtx, value, expr, ti.Columns)
+			skip, err := SkipDMLByExpression(s.sessCtx, filterRow, expr)
 			if err != nil {
 				return nil, err
 			}
@@ -304,12 +329,23 @@ RowLoop:
 			downstreamTableInfo.TableInfo,
 			s.sessCtx,
 		)
-		rowChange.SetWhereHandle(downstreamTableInfo.WhereHandle)
+		rowChange.SetWhereHandle(whereHandle)
+		rowChange.SetCausalityKeySourceTable(causalityKeySourceTable)
 		rowChange.SetForeignKeyRelations(downstreamTableInfo.ForeignKeyRelations)
 		dmls = append(dmls, rowChange)
 	}
 
 	return dmls, nil
+}
+
+func (s *Syncer) causalityKeySourceTableNameForRowChange(sourceTable *filter.Table) *cdcmodel.TableName {
+	if !s.needForeignKeyCausality() || s.cfg.CaseSensitive {
+		return nil
+	}
+	return &cdcmodel.TableName{
+		Schema: strings.ToLower(sourceTable.Schema),
+		Table:  strings.ToLower(sourceTable.Name),
+	}
 }
 
 func castUnsigned(data interface{}, ft *types.FieldType) interface{} {

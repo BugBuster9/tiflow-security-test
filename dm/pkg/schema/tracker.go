@@ -83,17 +83,54 @@ type downstreamTracker struct {
 	tableInfos     map[string]*DownstreamTableInfo // downstream table infos
 }
 
-// DownstreamTableInfo contains tableinfo and index cache.
+// DownstreamTableInfo holds downstream schema and WHERE handle caches.
 type DownstreamTableInfo struct {
 	TableInfo           *model.TableInfo // tableInfo which comes from parse create statement syntaxtree
-	WhereHandle         *sqlmodel.WhereHandle
+	whereHandleCache    *downstreamWhereHandleCache
 	ForeignKeyRelations []sqlmodel.ForeignKeyCausalityRelation
 	foreignKeyInitOnce  sync.Once
 	foreignKeyInitErr   error
 }
 
+// downstreamWhereHandleCache keeps the default handle and per-source handles.
+type downstreamWhereHandleCache struct {
+	defaultHandle *sqlmodel.WhereHandle
+	mu            sync.Mutex
+	bySource      map[string]*sqlmodel.WhereHandle
+}
+
+// DefaultWhereHandle returns the handle built with the initial source table.
+func (dti *DownstreamTableInfo) DefaultWhereHandle() *sqlmodel.WhereHandle {
+	return dti.whereHandleCache.defaultHandle
+}
+
+// WithoutForeignKeyRelations returns a copy with the downstream table info and
+// where handle cache, but without FK causality relations.
+func (dti *DownstreamTableInfo) WithoutForeignKeyRelations() *DownstreamTableInfo {
+	if dti == nil {
+		return nil
+	}
+	return &DownstreamTableInfo{
+		TableInfo:        dti.TableInfo,
+		whereHandleCache: dti.whereHandleCache,
+	}
+}
+
+// WhereHandle gets or builds the handle for the given source table.
+func (dti *DownstreamTableInfo) WhereHandle(sourceTable *filter.Table, sourceTI *model.TableInfo) *sqlmodel.WhereHandle {
+	sourceKey := utils.GenTableID(sourceTable)
+	dti.whereHandleCache.mu.Lock()
+	defer dti.whereHandleCache.mu.Unlock()
+	if handle, ok := dti.whereHandleCache.bySource[sourceKey]; ok {
+		return handle
+	}
+	handle := sqlmodel.GetWhereHandle(sourceTI, dti.TableInfo)
+	dti.whereHandleCache.bySource[sourceKey] = handle
+	return handle
+}
+
 // TableRouteResolver resolves a source table to its downstream routed table.
-// A nil resolver means identity route.
+// Nil means the source table name is used as-is.
 type TableRouteResolver func(*filter.Table) *filter.Table
 
 type executorContext struct {
@@ -411,7 +448,7 @@ func (tr *Tracker) GetDownStreamTableInfo(tctx *tcontext.Context, tableID string
 		return nil, err
 	}
 
-	if err := dti.initForeignKeyRelations(tr, tctx, tableID, targetTable, targetTable, originTI, nil); err != nil {
+	if err := dti.initForeignKeyRelations(tr, tctx, tableID, targetTable, targetTable, originTI, nil, true); err != nil {
 		return nil, err
 	}
 
@@ -430,6 +467,7 @@ func (tr *Tracker) InitDownStreamForeignKeyRelations(
 	targetTable *filter.Table,
 	originTI *model.TableInfo,
 	routeResolver TableRouteResolver,
+	caseSensitive bool,
 ) (*DownstreamTableInfo, error) {
 	tableID := utils.GenTableID(targetTable)
 	dti, err := tr.GetDownStreamTableInfoWithoutForeignKey(tctx, tableID, originTI)
@@ -437,7 +475,7 @@ func (tr *Tracker) InitDownStreamForeignKeyRelations(
 		return nil, err
 	}
 
-	// Routed FK relations depend on the source table and resolver, so keep them
+	// Routed FK relations depend on the source table and route rules, so keep them
 	// out of the downstream table cache that is keyed only by target table ID.
 	if routeResolver != nil {
 		relations, err := tr.buildForeignKeyRelations(
@@ -448,20 +486,19 @@ func (tr *Tracker) InitDownStreamForeignKeyRelations(
 			dti.TableInfo,
 			originTI,
 			routeResolver,
+			caseSensitive,
 			make(map[string][]sqlmodel.ForeignKeyCausalityRelation),
 			make(map[string]struct{}),
 		)
 		if err != nil {
 			return nil, err
 		}
-		return &DownstreamTableInfo{
-			TableInfo:           dti.TableInfo,
-			WhereHandle:         dti.WhereHandle,
-			ForeignKeyRelations: relations,
-		}, nil
+		ret := dti.WithoutForeignKeyRelations()
+		ret.ForeignKeyRelations = relations
+		return ret, nil
 	}
 
-	if err := dti.initForeignKeyRelations(tr, tctx, tableID, sourceTable, targetTable, originTI, routeResolver); err != nil {
+	if err := dti.initForeignKeyRelations(tr, tctx, tableID, sourceTable, targetTable, originTI, routeResolver, caseSensitive); err != nil {
 		return nil, err
 	}
 	return dti, nil
@@ -499,8 +536,11 @@ func (dt *downstreamTracker) getOrInit(tctx *tcontext.Context, tableID string, o
 		}
 
 		dti = &DownstreamTableInfo{
-			TableInfo:   downstreamTI,
-			WhereHandle: sqlmodel.GetWhereHandle(originTI, downstreamTI),
+			TableInfo: downstreamTI,
+			whereHandleCache: &downstreamWhereHandleCache{
+				defaultHandle: sqlmodel.GetWhereHandle(originTI, downstreamTI),
+				bySource:      make(map[string]*sqlmodel.WhereHandle),
+			},
 		}
 		dt.tableInfos[tableID] = dti
 	}
@@ -515,6 +555,7 @@ func (dti *DownstreamTableInfo) initForeignKeyRelations(
 	targetTable *filter.Table,
 	originTI *model.TableInfo,
 	routeResolver TableRouteResolver,
+	caseSensitive bool,
 ) error {
 	dti.foreignKeyInitOnce.Do(func() {
 		relations, err := tr.buildForeignKeyRelations(
@@ -525,6 +566,7 @@ func (dti *DownstreamTableInfo) initForeignKeyRelations(
 			dti.TableInfo,
 			originTI,
 			routeResolver,
+			caseSensitive,
 			make(map[string][]sqlmodel.ForeignKeyCausalityRelation),
 			make(map[string]struct{}),
 		)
@@ -607,6 +649,7 @@ func (tr *Tracker) buildForeignKeyRelations(
 	downstreamTI *model.TableInfo,
 	originTI *model.TableInfo,
 	routeResolver TableRouteResolver,
+	caseSensitive bool,
 	cache map[string][]sqlmodel.ForeignKeyCausalityRelation,
 	visiting map[string]struct{},
 ) ([]sqlmodel.ForeignKeyCausalityRelation, error) {
@@ -617,7 +660,7 @@ func (tr *Tracker) buildForeignKeyRelations(
 		targetTable = utils.UnpackTableID(tableID)
 	}
 
-	sourceTableID := utils.GenTableID(sourceTable)
+	sourceTableID := foreignKeyRelationTableID(sourceTable, caseSensitive)
 	if relations, ok := cache[sourceTableID]; ok {
 		return relations, nil
 	}
@@ -632,20 +675,18 @@ func (tr *Tracker) buildForeignKeyRelations(
 	if routeResolver != nil {
 		routedSourceTable = routeResolver(sourceTable)
 	}
-	if len(downstreamTI.ForeignKeys) > 0 && !sameTableIdentity(routedSourceTable, targetTable) {
+	if len(downstreamTI.ForeignKeys) > 0 && !sameForeignKeyTableIdentity(routedSourceTable, targetTable, caseSensitive) {
 		if routeResolver == nil {
-			// Without a route resolver, source and target tables must match. Routed FK
-			// causality is enabled only after the syncer passes a validated resolver.
 			return nil, newForeignKeyRouteUnsupportedError(
 				fmt.Sprintf(
-					"foreign key causality with route under foreign_key_checks=1 and worker_count>1 is not supported yet; child table %s routes to %s; please use worker_count=1",
+					"foreign key causality under foreign_key_checks=1 and worker_count>1 requires aligned child tables; source child table %s and downstream child table %s do not match",
 					sourceTable,
 					targetTable,
 				),
 			)
 		}
-		// With a route resolver, this builder checks only the current source table's
-		// routed target. Syncer must reject many-to-one topology before this call.
+		// This builder checks one routed source table at a time. Syncer must reject
+		// many-to-one routing before this call.
 		return nil, newForeignKeyRouteUnsupportedError(
 			fmt.Sprintf(
 				"foreign key causality with route under foreign_key_checks=1 and worker_count>1 requires 1:1 route alignment; source child table %s routes to %s, but downstream child table is %s",
@@ -669,12 +710,12 @@ func (tr *Tracker) buildForeignKeyRelations(
 			continue
 		}
 
-		sourceFK := findMatchingForeignKey(originTI, sourceTable, targetTable, fk, i, routeResolver)
+		sourceFK := findMatchingForeignKey(originTI, sourceTable, targetTable, fk, i, routeResolver, caseSensitive)
 		if sourceFK == nil {
 			return nil, newForeignKeySchemaAlignmentError(
 				sourceTable.String(),
 				fmt.Sprintf(
-					"foreign key causality under foreign_key_checks=1 and worker_count>1 requires aligned source and downstream FK metadata; failed to match source foreign key metadata for table %s and downstream FK %s; please align the schema metadata first, and if route is enabled for this table, please use worker_count=1",
+					"foreign key causality under foreign_key_checks=1 and worker_count>1 requires aligned source and downstream FK metadata; failed to match source foreign key metadata for table %s and downstream FK %s; please align the source and downstream FK metadata first",
 					sourceTable,
 					fk.Name.O,
 				),
@@ -716,12 +757,12 @@ func (tr *Tracker) buildForeignKeyRelations(
 		if routeResolver != nil {
 			routedSourceParent = routeResolver(sourceParentTable)
 		}
-		// The source parent table must route to the downstream parent table.
-		if !sameTableIdentity(routedSourceParent, targetParentTable) {
+		// The source parent table must match the downstream parent table after route rules are applied.
+		if !sameForeignKeyTableIdentity(routedSourceParent, targetParentTable, caseSensitive) {
 			if routeResolver == nil {
 				return nil, newForeignKeyRouteUnsupportedError(
 					fmt.Sprintf(
-						"foreign key causality with route under foreign_key_checks=1 and worker_count>1 is not supported yet; upstream parent table %s and downstream parent table %s do not align for FK %s on table %s; please use worker_count=1",
+						"foreign key causality under foreign_key_checks=1 and worker_count>1 requires aligned parent tables; source parent table %s and downstream parent table %s do not match for FK %s on table %s",
 						sourceParentTable,
 						targetParentTable,
 						fk.Name.O,
@@ -741,14 +782,17 @@ func (tr *Tracker) buildForeignKeyRelations(
 			)
 		}
 
-		parentTableID := utils.GenTableID(targetParentTable)
-		parentTableName := (&cdcmodel.TableName{Schema: sourceParentSchema, Table: sourceFK.RefTable.O}).String()
+		// Use the downstream parent table to read downstream schema, and use the source
+		// parent table to build causality keys.
+		parentDownstreamTableID := utils.GenTableID(targetParentTable)
+		parentSourceTable := normalizeForeignKeyTable(sourceParentTable, caseSensitive)
+		parentTableName := (&cdcmodel.TableName{Schema: parentSourceTable.Schema, Table: parentSourceTable.Name}).String()
 
 		parentOriginTI, err := tr.GetTableInfo(sourceParentTable)
 		if err != nil {
 			return nil, err
 		}
-		parentDTI, err := tr.downstreamTracker.getOrInit(tctx, parentTableID, parentOriginTI)
+		parentDTI, err := tr.downstreamTracker.getOrInit(tctx, parentDownstreamTableID, parentOriginTI)
 		if err != nil {
 			return nil, err
 		}
@@ -767,12 +811,13 @@ func (tr *Tracker) buildForeignKeyRelations(
 		parentNameToIdx := buildColumnIndexMap(parentOriginTI)
 		parentRelations, err := tr.buildForeignKeyRelations(
 			tctx,
-			parentTableID,
+			parentDownstreamTableID,
 			sourceParentTable,
 			targetParentTable,
 			parentDTI.TableInfo,
 			parentOriginTI,
 			routeResolver,
+			caseSensitive,
 			cache,
 			visiting,
 		)
@@ -834,8 +879,7 @@ func (tr *Tracker) buildForeignKeyRelations(
 
 // findMatchingForeignKey maps a downstream FK back to source-side metadata.
 // A same-name source FK must match the columns and never falls back to another FK.
-// Without a same-name FK, candidates must match both columns and the referenced
-// table when a route resolver is available.
+// Without a same-name FK, candidates must match both columns and the referenced table.
 func findMatchingForeignKey(
 	originTI *model.TableInfo,
 	sourceTable *filter.Table,
@@ -843,6 +887,7 @@ func findMatchingForeignKey(
 	downstreamFK *model.FKInfo,
 	idx int,
 	routeResolver TableRouteResolver,
+	caseSensitive bool,
 ) *model.FKInfo {
 	if originTI == nil || len(originTI.ForeignKeys) == 0 || downstreamFK == nil {
 		return nil
@@ -859,13 +904,13 @@ func findMatchingForeignKey(
 
 	if idx < len(originTI.ForeignKeys) {
 		candidate := originTI.ForeignKeys[idx]
-		if sameForeignKeyMetadata(candidate, sourceTable, downstreamFK, targetTable, routeResolver) {
+		if sameForeignKeyMetadata(candidate, sourceTable, downstreamFK, targetTable, routeResolver, caseSensitive) {
 			return candidate
 		}
 	}
 
 	for _, fk := range originTI.ForeignKeys {
-		if sameForeignKeyMetadata(fk, sourceTable, downstreamFK, targetTable, routeResolver) {
+		if sameForeignKeyMetadata(fk, sourceTable, downstreamFK, targetTable, routeResolver, caseSensitive) {
 			return fk
 		}
 	}
@@ -879,17 +924,17 @@ func sameForeignKeyMetadata(
 	downstreamFK *model.FKInfo,
 	targetTable *filter.Table,
 	routeResolver TableRouteResolver,
+	caseSensitive bool,
 ) bool {
 	if !sameForeignKeyColumns(sourceFK, downstreamFK) {
 		return false
 	}
-	if routeResolver == nil {
-		return true
-	}
 
 	sourceParentTable := foreignKeyRefTable(sourceTable, sourceFK)
-	sourceParentTable = routeResolver(sourceParentTable)
-	return sameTableIdentity(sourceParentTable, foreignKeyRefTable(targetTable, downstreamFK))
+	if routeResolver != nil {
+		sourceParentTable = routeResolver(sourceParentTable)
+	}
+	return sameForeignKeyTableIdentity(sourceParentTable, foreignKeyRefTable(targetTable, downstreamFK), caseSensitive)
 }
 
 func sameForeignKeyColumns(sourceFK *model.FKInfo, downstreamFK *model.FKInfo) bool {
@@ -927,6 +972,28 @@ func sameTableIdentity(a *filter.Table, b *filter.Table) bool {
 		return a == b
 	}
 	return a.Schema == b.Schema && a.Name == b.Name
+}
+
+func sameForeignKeyTableIdentity(a *filter.Table, b *filter.Table, caseSensitive bool) bool {
+	a = normalizeForeignKeyTable(a, caseSensitive)
+	b = normalizeForeignKeyTable(b, caseSensitive)
+	return sameTableIdentity(a, b)
+}
+
+func foreignKeyRelationTableID(table *filter.Table, caseSensitive bool) string {
+	return utils.GenTableID(normalizeForeignKeyTable(table, caseSensitive))
+}
+
+// normalizeForeignKeyTable returns the table identity used by FK causality checks.
+// When table matching is case-insensitive, schema and table names use lowercase.
+func normalizeForeignKeyTable(table *filter.Table, caseSensitive bool) *filter.Table {
+	if table == nil || caseSensitive {
+		return table
+	}
+	return &filter.Table{
+		Schema: strings.ToLower(table.Schema),
+		Name:   strings.ToLower(table.Name),
+	}
 }
 
 func newForeignKeyRouteUnsupportedError(msg string) error {

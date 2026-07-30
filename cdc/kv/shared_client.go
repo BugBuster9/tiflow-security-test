@@ -276,6 +276,14 @@ func (s *SharedClient) AllocSubscriptionID() SubscriptionID {
 	return SubscriptionID(subscriptionIDGen.Add(1))
 }
 
+// GetTS returns the current PD TSO.
+func (s *SharedClient) GetTS(ctx context.Context) (int64, int64, error) {
+	if s.pd == nil {
+		return 0, 0, errors.New("pd client is nil")
+	}
+	return s.pd.GetTS(ctx)
+}
+
 // Subscribe the given table span.
 // NOTE: `span.TableID` must be set correctly.
 // It new a subscribedTable and store it in `s.totalSpans`,
@@ -824,7 +832,7 @@ func (s *SharedClient) handleResolveLockTasks(ctx context.Context) error {
 }
 
 func (s *SharedClient) logSlowRegions(ctx context.Context) error {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for {
 		select {
@@ -832,10 +840,6 @@ func (s *SharedClient) logSlowRegions(ctx context.Context) error {
 			return ctx.Err()
 		case <-ticker.C:
 		}
-		log.Info("event feed starts to check locked regions",
-			zap.String("namespace", s.changefeed.Namespace),
-			zap.String("changefeed", s.changefeed.ID))
-
 		currTime := s.pdClock.CurrentTime()
 		s.totalSpans.RLock()
 		var slowInitializeRegionCount int
